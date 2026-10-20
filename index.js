@@ -1,3 +1,5 @@
+import { DurableObject } from "cloudflare:workers";
+
 // Hinweis: Das Client-Script unten nutzt bewusst keine Backticks und kein "${...}",
 // damit es sicher in diesem Template-Literal stehen kann.
 const HTML = `<!DOCTYPE html>
@@ -90,6 +92,8 @@ const HTML = `<!DOCTYPE html>
     }
     @keyframes blink { 50% { border-color: transparent; } }
     .hint { margin: 1.4rem 0 0; font-size: .75rem; opacity: .6; }
+    .visitors { margin: .5rem 0 0; font-size: .8rem; color: var(--muted); }
+    .visitors b { color: var(--yellow); }
 
     /* Snake */
     #game { display: none; margin-top: 1.4rem; }
@@ -167,12 +171,29 @@ const HTML = `<!DOCTYPE html>
       </div>
 
       <p class="hint">Tipp: Klick auf die 🚧 …</p>
+      <p class="visitors" id="visitors" hidden>Du bist Besucher Nr. <b id="count"></b></p>
     </div>
     <div class="stripes"></div>
   </div>
 
   <script>
   (function () {
+    // ---- Besucherzähler ----
+    // Pro Browser-Sitzung wird nur einmal gezählt (Reload zählt nicht doppelt).
+    (function () {
+      var counted = false;
+      try { counted = sessionStorage.getItem('counted') === '1'; } catch (e) {}
+      fetch('/api/visit', { method: counted ? 'GET' : 'POST' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (!d || typeof d.count !== 'number') return;
+          document.getElementById('count').textContent = d.count.toLocaleString('de-DE');
+          document.getElementById('visitors').hidden = false;
+          try { sessionStorage.setItem('counted', '1'); } catch (e) {}
+        })
+        .catch(function () {});
+    })();
+
     // ---- Fortschrittsbalken ----
     var bar = document.getElementById('bar');
     var pctEl = document.getElementById('pct');
@@ -355,8 +376,53 @@ const HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// Durable Object mit SQLite-Speicher: zählt atomar, auch bei gleichzeitigen Besuchen.
+export class Counter extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec("CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)");
+    this.sql.exec("INSERT OR IGNORE INTO visits (id, n) VALUES (1, 0)");
+  }
+
+  read() {
+    return this.sql.exec("SELECT n FROM visits WHERE id = 1").one().n;
+  }
+
+  async get() {
+    return this.read();
+  }
+
+  async increment() {
+    this.sql.exec("UPDATE visits SET n = n + 1 WHERE id = 1");
+    return this.read();
+  }
+}
+
+const json = (body, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
+  });
+
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/api/visit") {
+      if (request.method !== "GET" && request.method !== "POST") {
+        return json({ error: "method not allowed" }, 405);
+      }
+      try {
+        const stub = env.COUNTER.getByName("global");
+        const count = request.method === "POST" ? await stub.increment() : await stub.get();
+        return json({ count });
+      } catch (e) {
+        // z. B. Free-Limit erreicht: Seite funktioniert trotzdem, nur ohne Zähler
+        return json({ count: null }, 503);
+      }
+    }
+
     return new Response(HTML, {
       headers: { "content-type": "text/html;charset=UTF-8" },
     });
