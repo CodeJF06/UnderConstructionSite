@@ -286,19 +286,41 @@ const HTML = `<!DOCTYPE html>
       requestAnimationFrame(frame);
     }
     (function () {
-      var counted = false;
-      try { counted = sessionStorage.getItem('counted') === '1'; } catch (e) {}
-      fetch('/api/visit', { method: counted ? 'GET' : 'POST' })
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (!d || typeof d.count !== 'number') return;
-          var visitorsEl = document.getElementById('visitors');
-          animateCount(document.getElementById('count'), d.count, 900);
-          visitorsEl.hidden = false;
-          requestAnimationFrame(function () { visitorsEl.classList.add('show'); });
-          try { sessionStorage.setItem('counted', '1'); } catch (e) {}
-        })
+      var countedAlready = false;
+      try { countedAlready = sessionStorage.getItem('counted') === '1'; } catch (e) {}
+      var visitorsEl = document.getElementById('visitors');
+      function showVisitors(d, animate) {
+        if (!d || typeof d.count !== 'number') return;
+        var countEl = document.getElementById('count');
+        if (animate) animateCount(countEl, d.count, 900);
+        else countEl.textContent = d.count.toLocaleString('de-DE');
+        visitorsEl.hidden = false;
+        requestAnimationFrame(function () { visitorsEl.classList.add('show'); });
+      }
+      // Anzeige: aktueller Stand, zählt nicht mit
+      fetch('/api/visit').then(function (r) { return r.json(); })
+        .then(function (d) { showVisitors(d, true); })
         .catch(function () {});
+
+      // Zählen: erst bei echter Interaktion, und nur einmal pro Sitzung
+      if (countedAlready) return;
+      var EVENTS = ['pointerdown', 'keydown', 'touchstart', 'scroll'];
+      var done = false;
+      function countVisit() {
+        if (done) return;
+        done = true;
+        EVENTS.forEach(function (ev) { window.removeEventListener(ev, countVisit, true); });
+        fetch('/api/visit', { method: 'POST' })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            showVisitors(d, false);
+            try { sessionStorage.setItem('counted', '1'); } catch (e) {}
+          })
+          .catch(function () {});
+      }
+      EVENTS.forEach(function (ev) {
+        window.addEventListener(ev, countVisit, { capture: true, passive: true });
+      });
     })();
 
     // ---- Fortschrittsbalken ----
@@ -1108,7 +1130,10 @@ export default {
     if (pathname === "/api/visit") {
       if (request.method !== "GET" && request.method !== "POST") return json({ error: "method not allowed" }, 405);
       try {
-        const count = request.method === "POST" ? await stub.increment() : await stub.get();
+        // Bots, Crawler und Link-Vorschauen zählen nicht mit
+        const ua = request.headers.get("user-agent") || "";
+        const isBot = !ua || /bot|crawl|spider|slurp|preview|facebookexternalhit|headless|curl|wget|python|go-http|monitor/i.test(ua);
+        const count = request.method === "POST" && !isBot ? await stub.increment() : await stub.get();
         return json({ count });
       } catch (e) {
         return json({ count: null }, 503);
